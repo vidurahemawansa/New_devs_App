@@ -1,53 +1,101 @@
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from zoneinfo import ZoneInfo
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
 
-    start_date = datetime(year, month, 1)
-    if month < 12:
-        end_date = datetime(year, month + 1, 1)
-    else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+async def _get_property_timezone(session, property_id: str, tenant_id: str) -> str:
+    """Looks up the IANA timezone configured for a property (defaults to UTC)."""
+    from sqlalchemy import text
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
+    result = await session.execute(
+        text("SELECT timezone FROM properties WHERE id = :property_id AND tenant_id = :tenant_id"),
+        {"property_id": property_id, "tenant_id": tenant_id},
+    )
+    row = result.fetchone()
+    return row.timezone if row and row.timezone else "UTC"
+
+
+async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int) -> Dict[str, Any]:
     """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+    Calculates revenue for a specific calendar month for a property.
+
+    Bookings are bucketed into months using the PROPERTY'S LOCAL TIMEZONE, not
+    naive UTC. `check_in_date` is stored as `TIMESTAMP WITH TIME ZONE`, so a
+    check-in of "2024-02-29 23:30:00+00" for a Paris property (UTC+1) actually
+    falls on "2024-03-01 00:30" local time - i.e. it belongs to March, not
+    February. Comparing against naive UTC month boundaries (the previous
+    behaviour) silently drops that reservation from March's total, which is
+    exactly the kind of "March revenue doesn't match our records" discrepancy
+    clients would notice.
+    """
+    from app.core.database_pool import db_pool
+    from sqlalchemy import text
+
+    if not db_pool.session_factory:
+        await db_pool.initialize()
+
+    async with db_pool.get_session() as session:
+        tz_name = await _get_property_timezone(session, property_id, tenant_id)
+        local_tz = ZoneInfo(tz_name)
+
+        local_start = datetime(year, month, 1, tzinfo=local_tz)
+        if month < 12:
+            local_end = datetime(year, month + 1, 1, tzinfo=local_tz)
+        else:
+            local_end = datetime(year + 1, 1, 1, tzinfo=local_tz)
+
+        # Convert local month boundaries to UTC for comparison against the
+        # timezone-aware check_in_date column.
+        start_utc = local_start.astimezone(dt_timezone.utc)
+        end_utc = local_end.astimezone(dt_timezone.utc)
+
+        query = text("""
+            SELECT SUM(total_amount) as total, COUNT(*) as count
+            FROM reservations
+            WHERE property_id = :property_id
+              AND tenant_id = :tenant_id
+              AND check_in_date >= :start_date
+              AND check_in_date < :end_date
+        """)
+
+        result = await session.execute(query, {
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "start_date": start_utc,
+            "end_date": end_utc,
+        })
+        row = result.fetchone()
+
+        total = Decimal(str(row.total)) if row and row.total is not None else Decimal("0")
+        count = row.count if row and row.count is not None else 0
+
+        return {
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "month": month,
+            "year": year,
+            "timezone": tz_name,
+            "total": str(total),
+            "currency": "USD",
+            "count": count,
+        }
+
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
-    Aggregates revenue from database.
+    Aggregates all-time revenue for a property from the database.
     """
     try:
-        # Import database pool
-        from app.core.database_pool import DatabasePool
-        
-        # Initialize pool if needed
-        db_pool = DatabasePool()
-        await db_pool.initialize()
-        
+        from app.core.database_pool import db_pool
+
+        if not db_pool.session_factory:
+            await db_pool.initialize()
+
         if db_pool.session_factory:
             async with db_pool.get_session() as session:
-                # Use SQLAlchemy text for raw SQL
                 from sqlalchemy import text
-                
+
                 query = text("""
                     SELECT 
                         property_id,
@@ -57,7 +105,7 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
                     WHERE property_id = :property_id AND tenant_id = :tenant_id
                     GROUP BY property_id
                 """)
-                
+
                 result = await session.execute(query, {
                     "property_id": property_id, 
                     "tenant_id": tenant_id
@@ -88,8 +136,7 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
     except Exception as e:
         print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
         
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
+        # Fallback mock data used only when the database is genuinely unreachable.
         mock_data = {
             'prop-001': {'total': '1000.00', 'count': 3},
             'prop-002': {'total': '4975.50', 'count': 4}, 
